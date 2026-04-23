@@ -133,7 +133,7 @@ receivers:
       # to collect logs from. Supports glob patterns.
       # Fill in with actual log file paths from your host applications.
       # =====================================================================
-      # - /var/log/syslog
+      - /var/log/syslog
 
     exclude:
       # =====================================================================
