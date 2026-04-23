@@ -1,5 +1,5 @@
 # =============================================================================
-# OpenTelemetry Collector — VM Host Agent
+# OpenTelemetry Collector — VM Host Agent for Docker Services
 # Purpose: Collect metrics, Docker container logs, and host application logs
 #          from a VM running Docker containers and bare-metal services.
 # Exports: Loki (logs), Prometheus/Thanos (metrics)
