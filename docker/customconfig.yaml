@@ -1,0 +1,403 @@
+# =============================================================================
+# OpenTelemetry Collector — VM Host Agent
+# Purpose: Collect metrics, Docker container logs, and host application logs
+#          from a VM running Docker containers and bare-metal services.
+# Exports: Loki (logs), Prometheus/Thanos (metrics)
+# =============================================================================
+#
+# Data Flow:
+#   node-exporter :9100  → prometheus receiver → prometheusremotewrite → Prometheus/Thanos
+#   Docker container logs → filelog/docker      → otlphttp             → Loki
+#   Host app logs         → filelog/hostapps    → otlphttp             → Loki
+#
+# =============================================================================
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# RECEIVERS
+# ═══════════════════════════════════════════════════════════════════════════════
+receivers:
+
+  # ---------------------------------------------------------------------------
+  # Metrics: Scrape node-exporter for host-level metrics (CPU, memory, disk, etc.)
+  # Prerequisite: node-exporter running on the same host at :9100
+  # ---------------------------------------------------------------------------
+  prometheus:
+    config:
+      scrape_configs:
+        - job_name: "node-exporter"
+          scrape_interval: 30s
+          static_configs:
+            - targets: ["127.0.0.1:9100"] #vm_host_ip
+              labels:
+                instance: "${env:HOSTNAME}"
+
+        - job_name: "cadvisor"
+          scrape_interval: 30s
+          scrape_timeout: 20s
+          static_configs:
+            - targets: ["localhost:8080"]
+              labels:
+                instance: "${env:HOSTNAME}"
+          metric_relabel_configs:
+            # ✅ Drop semua label container_label_com_docker_compose_*
+            # karena tidak berguna & menyebabkan high cardinality
+            - regex: "container_label_com_docker_compose_.*"
+              action: labeldrop
+            # ✅ Drop label org_opencontainers yang juga tidak berguna
+            - regex: "container_label_org_opencontainers_.*"
+              action: labeldrop
+            # ✅ Hanya ambil metrics container yang aktif
+            # Drop metric tanpa container name (host-level noise)
+            - source_labels: [container]
+              regex: "^$"
+              action: drop
+
+       # Uncomment to scrape additional exporters running on this host
+
+
+        # Uncomment to scrape additional exporters running on this host
+        # - job_name: "nginx-exporter"
+        #   scrape_interval: 30s
+        #   static_configs:
+        #     - targets: ["localhost:9113"]
+        #       labels:
+        #         instance: "${env:HOSTNAME}"
+
+
+  # ---------------------------------------------------------------------------
+  # Logs: Docker container via docker log
+  # Disini receiver akan langsung mengambil informasi log dan nama container pada container existing
+  # ---------------------------------------------------------------------------
+
+#  docker_logs:
+#    endpoint: unix:///var/run/docker.sock
+#    container_labels_to_log_attributes:
+#      app_name: app_name        # mapping Docker label → log attribute
+#    resource_attributes:
+#      container.name:
+#        enabled: true           # otomatis ambil nama container
+#      container.id:
+#       enabled: true
+#     container.image.name:
+#       enabled: true
+
+
+  # ---------------------------------------------------------------------------
+  # Logs: Docker container stdout/stderr
+  # Reads JSON log files written by Docker's default logging driver
+  # Path: /var/lib/docker/containers/<container-id>/<container-id>-json.log
+  # ---------------------------------------------------------------------------
+  filelog/docker:
+    include:
+      - /var/lib/docker/containers/*/*.log
+    exclude:
+      # =====================================================================
+      # EXCLUDE CONTAINERS: Add container IDs or use the filter_by_name
+      # operator below to skip specific containers.
+      #
+      # Option 1 — Exclude by container ID (get from 'docker ps --no-trunc'):
+      # - /var/lib/docker/containers/<full-container-id>/*.log
+      #
+      # Option 2 — Exclude collector itself (recommended):
+      # Find collector container ID: docker inspect otel-collector --format '{{.Id}}'
+      # Then add: - /var/lib/docker/containers/<collector-container-id>/*.log
+      # =====================================================================
+    start_at: end
+    include_file_path: true
+    include_file_name: false
+
+    operators:
+      # Parse Docker JSON log format: {"log":"...","stream":"stdout","time":"..."}
+      - type: json_parser
+        id: docker-json
+        parse_from: body
+        timestamp:
+          parse_from: attributes.time
+          layout: "%Y-%m-%dT%H:%M:%S.%LZ"
+
+      # Move the actual log line to body
+      - type: move
+        id: move-log-to-body
+        from: attributes.log
+        to: body
+
+      # Extract container name from Docker log tag
+      - type: move
+        id: move-tag
+        if: 'attributes?.attrs?.tag != nil'
+        from: attributes.attrs.tag
+        to: attributes.app_name
+
+
+      # Set stream (stdout/stderr) as attribute
+      - type: move
+        id: move-stream
+        from: attributes.stream
+        to: attributes["log.iostream"]
+
+      # Extract container ID from file path for identification
+      - type: regex_parser
+        id: extract-container-id
+        parse_from: attributes["log.file.path"]
+        regex: '/var/lib/docker/containers/(?P<container_id>[a-f0-9]{64})/'
+        on_error: send
+
+      # =====================================================================
+      # EXCLUDE CONTAINERS BY NAME: Use a filter operator to drop logs
+      # from specific containers. This is easier than excluding by ID.
+      #
+      # To use this, you need the Docker observer or a lookup mechanism.
+      # A simpler approach: use the 'include' paths instead of 'exclude',
+      # or use the resource processor to drop by container name after
+      # enrichment. See the filter/docker processor below.
+      # =====================================================================
+
+      # Parse JSON-structured log bodies (if apps log as JSON)
+      - type: json_parser
+        id: json-body-parser
+        if: 'body matches "^\\{"'
+        parse_from: body
+        parse_to: attributes
+        on_error: send
+
+      # Map severity from structured logs
+      - type: severity_parser
+        id: severity-parser
+        if: 'attributes["level"] != nil or attributes["severity"] != nil'
+        parse_from: attributes.level
+        mapping:
+          debug: ["DEBUG", "debug", "TRACE", "trace"]
+          info: ["INFO", "info"]
+          warn: ["WARNING", "warning", "WARN", "warn"]
+          error: ["ERROR", "error"]
+          fatal: ["CRITICAL", "critical", "FATAL", "fatal"]
+        on_error: send
+
+  # ---------------------------------------------------------------------------
+  # Logs: Host application logs (bare-metal services, not Docker)
+  # Add/remove paths as needed for your specific host applications
+  # ---------------------------------------------------------------------------
+#  filelog/hostapps:
+#    include:
+      # =====================================================================
+      # HOST APP LOG PATHS: Add paths for each host application you want
+      # to collect logs from. Supports glob patterns.
+      # =====================================================================
+      #- /var/log/nginx/access.log
+      #- /var/log/nginx/error.log
+      #- /var/log/typesense/typesense.log
+      # - /var/log/myapp/*.log
+      # - /var/log/syslog
+
+#    exclude:
+      # =====================================================================
+      # EXCLUDE SPECIFIC LOG FILES: Skip files you don't want collected
+      # =====================================================================
+      # - /var/log/nginx/debug.log
+      # - /var/log/myapp/audit.log
+
+#    start_at: end
+#    include_file_path: true
+#    include_file_name: true
+
+#    operators:
+      # Tag with source application based on file path
+#      - type: regex_parser
+#        id: extract-app-name
+#        parse_from: attributes["log.file.path"]
+#        regex: '/var/log/(?P<app_name>[^/]+)/'
+#        on_error: send
+
+      # Parse JSON-structured log bodies
+#      - type: json_parser
+#        id: json-parser
+#        if: 'body matches "^\\{"'
+#        parse_from: body
+#        parse_to: attributes
+#        on_error: send
+
+      # Parse common Nginx access log format
+#      - type: regex_parser
+#        id: nginx-access-parser
+#        if: 'attributes["log.file.name"] == "access.log"'
+#        parse_from: body
+#        regex: '^(?P<remote_addr>[^ ]*) - (?P<remote_user>[^ ]*) \[(?P<time_local>[^\]]*)\] "(?P<request>[^"]*)" (?P<status>[^ ]*) (?P<body_bytes_sent>[^ ]*)'
+#        on_error: send
+
+      # Extract nginx error level: format is "YYYY/MM/DD HH:MM:SS [level] ..."
+#      - type: regex_parser
+#        id: nginx-error-level
+#        if: 'attributes["log.file.name"] == "error.log"'
+#        parse_from: body
+#        regex: '\[(?P<nginx_level>debug|info|notice|warn|error|crit|alert|emerg)\]'
+#        on_error: send
+
+      # Map nginx error level to OTel severity
+#      - type: severity_parser
+#        id: nginx-severity
+#        if: 'attributes["nginx_level"] != nil'
+#        parse_from: attributes.nginx_level
+#        mapping:
+#          debug: ["debug"]
+#          info: ["info", "notice"]
+#          warn: ["warn"]
+#          error: ["error"]
+#          fatal: ["crit", "alert", "emerg"]
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PROCESSORS
+# ═══════════════════════════════════════════════════════════════════════════════
+processors:
+
+  # Memory limiter — prevents OOM
+  memory_limiter:
+    check_interval: 5s
+    limit_percentage: 80
+    spike_limit_percentage: 25
+
+  # Batch — improves export efficiency
+  batch:
+    send_batch_size: 1024
+    send_batch_max_size: 2048
+    timeout: 5s
+
+  # Add host metadata to all signals
+  resourcedetection:
+    detectors: [env, system]
+    timeout: 5s
+    system:
+      hostname_sources: ["os"]
+
+  # Static resource attributes — identify this VM
+  resource:
+    attributes:
+      - key: host.name
+        from_attribute: host.name
+        action: upsert
+      - key: cluster
+        value: "hostame"  # change based on hostname
+        action: upsert
+      - key: environment
+        value: "production"  # CHANGE: your environment
+        action: upsert
+      - key: source
+        value: "vm"
+        action: upsert
+
+  # Tag Docker logs with container source
+  resource/docker:
+    attributes:
+      - key: log.source
+        value: "docker"
+        action: upsert
+      - key: environment
+        value: "production"
+        action: upsert
+
+  # Tag host app logs with host source
+  resource/hostapps:
+    attributes:
+      - key: log.source
+        value: "host"
+        action: upsert
+      - key: environment
+        value: "production"
+        action: upsert
+
+  # Derive service.name from Docker container or host app name
+  transform/service_name:
+    error_mode: ignore
+    log_statements:
+      # First: copy app_name from log attributes to resource attributes
+      - context: log
+        statements:
+          - set(resource.attributes["service.name"], attributes["app_name"])
+            where resource.attributes["service.name"] == nil and attributes["app_name"] != nil
+          # For Docker logs: use container_id short form as fallback
+          - set(resource.attributes["service.name"], attributes["attrs_tag"])
+            where resource.attributes["service.name"] == nil and attributes["attrs_tag"] != nil
+#          - set(resource.attributes["service.name"], attributes["container_id"])
+#            where resource.attributes["service.name"] == nil and attributes["container_id"] != nil
+          # Final fallback
+          - set(resource.attributes["service.name"], "unknown_service")
+            where resource.attributes["service.name"] == nil
+
+  # ===========================================================================
+  # OPTIONAL: Filter out specific Docker container logs by name
+  # Uncomment and adjust the container names to exclude.
+  # This requires container_name to be in resource attributes.
+  # Alternative: use the exclude paths in filelog/docker receiver above.
+  # ===========================================================================
+  # filter/docker:
+  #   logs:
+  #     exclude:
+  #       match_type: regexp
+  #       resource_attributes:
+  #         - key: container.name
+  #           value: "^(otel-collector|node-exporter)$"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# EXPORTERS
+# ═══════════════════════════════════════════════════════════════════════════════
+exporters:
+
+  # --- Loki: OTLP HTTP (all logs) ---
+  otlphttp/loki:
+    endpoint: "http://10.48.128.20:3100/otlp"
+    tls:
+      insecure: true
+
+  # --- Prometheus/Thanos: Remote Write (metrics) ---
+  prometheusremotewrite/thanos:
+    endpoint: "http://10.48.128.20:9091/api/v1/write"
+    tls:
+      insecure: true
+    resource_to_telemetry_conversion:
+      enabled: true
+
+  # Debug exporter (enable temporarily for troubleshooting)
+  # debug:
+    # verbosity: detailed
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# EXTENSIONS
+# ═══════════════════════════════════════════════════════════════════════════════
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SERVICE / PIPELINES
+# ═══════════════════════════════════════════════════════════════════════════════
+service:
+  extensions: [health_check]
+
+  telemetry:
+    logs:
+      level: info
+    metrics:
+      readers:
+        - pull:
+            exporter:
+              prometheus:
+                host: "0.0.0.0"
+                port: 8888
+
+  pipelines:
+    # --- Metrics: node-exporter → Prometheus/Thanos ---
+    metrics:
+      receivers: [prometheus]
+      processors: [memory_limiter, resourcedetection, resource, batch]
+      exporters: [prometheusremotewrite/thanos]
+
+    # --- Logs: Docker container stdout → Loki ---
+    logs/docker:
+      receivers: [filelog/docker]
+      processors: [memory_limiter, resourcedetection, resource/docker, transform/service_name, batch]
+      exporters: [otlphttp/loki]
+
+    # --- Logs: Host application logs → Loki ---
+#    logs/hostapps:
+#      receivers: [filelog/hostapps]
+#      processors: [memory_limiter, resourcedetection, resource/hostapps, transform/service_name, batch]
+#      exporters: [otlphttp/loki]
